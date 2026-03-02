@@ -129,8 +129,44 @@ python manage_keys.py test
 
 ## 🛠️ 集成示例
 
-### 集成到 nanobot
+### ✅ 已验证兼容的系统
 
+#### 1. nanobot 集成 (完全兼容)
+```python
+# nanobot 自动集成，无需额外配置
+# CustomProvider 已内置 API Key 轮询功能
+from nanobot.providers.custom_provider import CustomProvider
+
+provider = CustomProvider(
+    api_base="https://apis.iflow.cn/v1",
+    default_model="glm-4.6"
+)
+# 自动轮询多个 API keys，429 错误自动处理
+```
+
+#### 2. OpenClaw 集成 (完全兼容)
+```python
+from api_key_manager import APIKeyManager
+
+# 创建管理器实例
+manager = APIKeyManager(config_path="openclaw_config.json")
+
+# 获取 API key
+api_key = manager.get_next_key()
+if not api_key:
+    print("没有可用的 API key")
+    return
+
+# 使用 API key 进行请求
+try:
+    response = make_llm_request(api_key, prompt)
+except Exception as e:
+    if "429" in str(e):
+        manager.mark_error(api_key, "429")
+    raise
+```
+
+### 通用集成模式
 ```python
 # 在 API 调用中使用
 api_key = key_manager.get_next_key()
@@ -152,6 +188,47 @@ except Exception as e:
 ## 📄 许可证
 
 MIT License
+
+## 🧪 兼容性测试
+
+项目包含完整的兼容性测试套件：
+
+```bash
+# 运行兼容性测试
+python3 compatibility_test.py
+```
+
+### 测试覆盖范围
+- ✅ nanobot 集成测试
+- ✅ OpenClaw 兼容性测试  
+- ✅ 轮询功能测试
+- ✅ 错误处理测试
+- ✅ 配置管理测试
+
+### 测试结果
+```
+🧪 API Key管理器兼容性测试开始
+
+🤖 测试nanobot集成...
+✅ API Key管理器导入成功
+✅ 获取API key成功
+✅ 统计信息: 3个keys, 3个健康
+✅ CustomProvider导入成功
+✅ CustomProvider实例创建成功
+
+🔧 测试OpenClaw兼容性...
+✅ OpenClaw项目目录存在
+✅ OpenClaw API Key管理器创建成功
+✅ 轮询功能正常
+✅ 错误处理功能正常
+
+🎉 所有测试通过！API Key管理器可以在两个系统中正常使用！
+```
+
+## 📚 详细文档
+
+- [OpenClaw 集成指南](openclaw_integration_guide.md) - 详细的 OpenClaw 集成步骤
+- [兼容性测试代码](compatibility_test.py) - 完整的测试套件
 
 ## 📞 联系
 
