@@ -8,26 +8,53 @@ import json
 import time
 import threading
 from typing import List, Dict, Optional
+from collections import deque
 
 
 class APIKeyManager:
     def __init__(self, config_path: str = "/root/.nanobot/config.json"):
-        self.config_path = config_path
+        # 优先使用本地配置文件（包含真实key），如果不存在则使用公共配置文件
+        local_config_path = "/root/.nanobot/config.local.json"
+        import os
+        if os.path.exists(local_config_path):
+            self.config_path = local_config_path
+        else:
+            self.config_path = config_path
         self.api_keys: List[str] = []
         self.current_index: int = 0
+        # QPS限制配置
+        self.qps_limit_per_key = 10  # 每个key限制10 QPS
+        self.qps_window = 1.0  # 时间窗口1秒
         # key_stats 结构:
         # {
         #   key: {
         #       'requests': int,
         #       'errors': int,
         #       'last_used': float(timestamp),
-        #       'healthy': bool
+        #       'healthy': bool,
+        #       'request_times': deque([timestamp1, timestamp2, ...])  # 请求时间戳队列
         #   }
         # }
         self.key_stats: Dict[str, Dict] = {}
         self.lock = threading.Lock()
         self.strategy = "round-robin"
         self.load_config()
+
+    def _is_key_rate_limited(self, api_key: str) -> bool:
+        """检查key是否超过QPS限制"""
+        stats = self.key_stats.get(api_key)
+        if not stats:
+            return False
+        
+        current_time = time.time()
+        request_times = stats["request_times"]
+        
+        # 清理过期的请求时间戳（超过时间窗口的）
+        while request_times and current_time - request_times[0] > self.qps_window:
+            request_times.popleft()
+        
+        # 检查当前窗口内的请求数是否超过限制
+        return len(request_times) >= self.qps_limit_per_key
 
     def load_config(self):
         """加载配置文件中的 key 列表"""
@@ -40,6 +67,26 @@ class APIKeyManager:
 
             # 你自己维护的 key 池
             self.api_keys = custom.get("apiKeys", [])
+            
+            # 添加备用key到key池
+            fallback = custom.get("fallback", {})
+            if fallback.get("enabled", False):
+                fallback_key = fallback.get("apiKey")
+                if fallback_key:
+                    self.fallback_key = fallback_key
+                    self.fallback_config = fallback
+                    # 如果备用key不在主key池中，添加它
+                    if fallback_key not in self.api_keys:
+                        self.api_keys.append(fallback_key)
+                        print(f"✅ 备用key已添加: {fallback.get('name', 'Unknown')}")
+                    else:
+                        print(f"✅ 备用key已配置: {fallback.get('name', 'Unknown')}")
+                else:
+                    self.fallback_key = None
+                    self.fallback_config = None
+            else:
+                self.fallback_key = None
+                self.fallback_config = None
 
             # 负载策略
             lb = custom.get("loadBalancing", {})
@@ -53,6 +100,8 @@ class APIKeyManager:
                         "errors": 0,
                         "last_used": 0.0,
                         "healthy": True,
+                        "request_times": deque(maxlen=self.qps_limit_per_key * 2),  # 保存最近2倍限制的请求
+                        "is_fallback": key == self.fallback_key if hasattr(self, 'fallback_key') else False
                     }
         except Exception as e:
             print(f"加载配置失败: {e}")
@@ -69,7 +118,7 @@ class APIKeyManager:
                 return self._round_robin()
 
     def _round_robin(self) -> Optional[str]:
-        """轮询策略: 跳过不健康 key，全不健康则返回 None"""
+        """轮询策略: 跳过不健康 key 和 QPS限制 key，全不健康/全限制则返回 None"""
         n = len(self.api_keys)
         if n == 0:
             return None
@@ -80,28 +129,34 @@ class APIKeyManager:
             self.current_index = (self.current_index + 1) % n
 
             stats = self.key_stats.get(key)
-            if stats and stats.get("healthy", True):
+            if stats and stats.get("healthy", True) and not self._is_key_rate_limited(key):
+                # 记录请求
+                current_time = time.time()
                 stats["requests"] += 1
-                stats["last_used"] = time.time()
+                stats["last_used"] = current_time
+                stats["request_times"].append(current_time)
                 return key
 
             attempts += 1
 
-        # 全部不健康
+        # 全部不健康或全部达到QPS限制
         return None
 
     def _least_used(self) -> Optional[str]:
-        """最少使用策略: 在健康 key 中选 requests 最少的"""
-        healthy_keys = [
+        """最少使用策略: 在健康且未达QPS限制的 key 中选 requests 最少的"""
+        available_keys = [
             k for k in self.api_keys
-            if self.key_stats.get(k, {}).get("healthy", True)
+            if (self.key_stats.get(k, {}).get("healthy", True) and 
+                not self._is_key_rate_limited(k))
         ]
-        if not healthy_keys:
+        if not available_keys:
             return None
 
-        best_key = min(healthy_keys, key=lambda k: self.key_stats[k]["requests"])
+        best_key = min(available_keys, key=lambda k: self.key_stats[k]["requests"])
+        current_time = time.time()
         self.key_stats[best_key]["requests"] += 1
-        self.key_stats[best_key]["last_used"] = time.time()
+        self.key_stats[best_key]["last_used"] = current_time
+        self.key_stats[best_key]["request_times"].append(current_time)
         return best_key
 
     def mark_error(self, api_key: str, error_type: str = "429"):
@@ -144,6 +199,7 @@ class APIKeyManager:
                     "errors": 0,
                     "last_used": 0.0,
                     "healthy": True,
+                    "request_times": deque(maxlen=self.qps_limit_per_key * 2),
                 }
                 self._save_config()
 
