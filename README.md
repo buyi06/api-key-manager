@@ -5,11 +5,13 @@
 ## ✨ 特性
 
 - 🔄 **多策略轮询**: 支持 round-robin 和 least-used 两种负载均衡策略
-- 🛡️ **QPS限制**: 每个key独立QPS限制，防止触发API限流
+- 🛡️ **QPS限制**: 每个key独立QPS限制（默认10/s），防止触发API限流
+- 🔒 **并发限制**: 每个key独立并发限制（默认1），防止并发冲突
+- ⏰ **有效期管理**: 每个key 7天有效期，过期自动标记，支持过期提醒
 - 🚨 **智能故障转移**: 自动检测 429 错误并临时禁用限流的 API key
 - 🔧 **备用key支持**: 主key全部不可用时自动切换到备用key
-- 🔧 **动态管理**: 支持运行时添加和移除 API key
-- 📊 **统计监控**: 实时统计每个 key 的使用情况和健康状态
+- 🔧 **动态管理**: 支持运行时添加、移除、替换 API key
+- 📊 **统计监控**: 实时统计每个 key 的使用情况、健康状态、剩余有效期
 - 💾 **配置持久化**: 自动保存配置到 JSON 文件
 - 🎯 **线程安全**: 使用锁机制确保并发安全
 - 📁 **本地配置优先**: 优先使用 config.local.json 存储敏感信息
@@ -57,45 +59,70 @@ print(f"健康key数量: {stats['healthy_keys']}/{stats['total_keys']}")
         "sk-第二个key", 
         "sk-第三个key"
       ],
-      "apiBase": "https://apis.iflow.cn/v1",
-      "maxConcurrentRequests": 10,
-      "retryDelay": 5000,
-      "maxRetries": 6,
+      "limits": {
+        "qps": 10,
+        "concurrency": 1,
+        "maxAgeDays": 7,
+        "cooldownSeconds": 30
+      },
       "loadBalancing": {
-        "strategy": "round-robin",
-        "healthCheck": true,
-        "failover": true,
-        "healthCheckInterval": 300
+        "strategy": "round-robin"
       },
       "fallback": {
         "enabled": true,
         "apiKey": "ak_备用key",
-        "apiBase": "https://api.longcat.chat/openai/v1",
-        "name": "LongCat-Flash-Thinking-2601",
-        "model": "LongCat-Flash-Thinking-2601"
+        "name": "备用Key"
+      },
+      "keyMetadata": {
+        "sk-第一个key": {
+          "created_at": 1709510400
+        }
       }
     }
   }
 }
 ```
 
+**配置说明:**
+- `limits.qps`: 每个key的QPS限制（默认10）
+- `limits.concurrency`: 每个key的并发限制（默认1）
+- `limits.maxAgeDays`: key的有效期天数（默认7）
+- `limits.cooldownSeconds`: 429错误冷却时间（默认30）
+- `keyMetadata`: 保存key的创建时间，用于有效期计算
+```
+
 ### 3. 命令行工具
 
 ```bash
 # 添加新的 API key
-python manage_keys.py add sk-your-new-api-key
+python3 manage_keys.py add sk-your-new-api-key
 
 # 移除 API key
-python manage_keys.py remove sk-old-api-key
+python3 manage_keys.py remove sk-old-api-key
 
-# 列出所有 keys
-python manage_keys.py list
+# 替换 API key（用于过期更换）
+python3 manage_keys.py replace sk-old-key sk-new-key
+
+# 列出所有 keys 及状态
+python3 manage_keys.py list
 
 # 查看统计信息
-python manage_keys.py stats
+python3 manage_keys.py stats
+
+# 查看已过期的keys
+python3 manage_keys.py expired
+
+# 查看即将过期的keys（默认24小时）
+python3 manage_keys.py expiring
+
+# 查看即将过期的keys（48小时内）
+python3 manage_keys.py expiring 48
 
 # 测试轮询功能
-python manage_keys.py test
+python3 manage_keys.py test
+
+# 设置key的创建时间（用于恢复已知key）
+python3 manage_keys.py set sk-xxx "2026-03-01T00:00:00"
 ```
 
 ## 📋 API 参考
@@ -104,11 +131,15 @@ python manage_keys.py test
 
 #### 主要方法
 
-- `get_next_key()` - 获取下一个可用的 API key
-- `add_key(api_key)` - 添加新的 API key
+- `get_next_key()` - 获取下一个可用的 API key（自动跳过不健康、过期、限流、并发满的key）
+- `release_key(api_key)` - 释放key（请求完成后必须调用，减少并发计数）
+- `add_key(api_key, created_at=None)` - 添加新的 API key
 - `remove_key(api_key)` - 移除 API key
-- `mark_error(api_key, error_type)` - 标记 key 出错
+- `replace_key(old_key, new_key)` - 替换 API key（用于过期更换）
+- `mark_error(api_key, error_type, retry_after=None)` - 标记 key 出错
 - `get_stats()` - 获取统计信息
+- `get_expired_keys()` - 获取所有过期的key
+- `get_expiring_keys(within_hours=24)` - 获取即将过期的key
 - `load_config()` - 加载配置文件
 
 #### 负载均衡策略
@@ -122,6 +153,20 @@ python manage_keys.py test
 - **时间窗口**: 1秒
 - **自动清理**: 超过时间窗口的请求自动清理
 - **智能跳过**: 达到限制的key自动跳过
+
+#### 并发限制
+
+- **默认限制**: 每个key同时最多1个请求
+- **自动跟踪**: 实时跟踪每个key的活跃请求数
+- **必须释放**: 请求完成后必须调用 `release_key()` 释放
+
+#### 有效期管理
+
+- **默认有效期**: 7天
+- **自动过期**: 过期后自动标记为不可用
+- **备用key例外**: 备用key永不过期
+- **后台清理**: 每小时自动检查过期key
+- **过期提醒**: 支持查询即将过期的key
 
 #### 错误处理
 
@@ -299,7 +344,17 @@ python3 compatibility_test.py
 
 ## 🔄 版本历史
 
-### v2.0.0 (最新)
+### v3.0.0 (最新)
+- ✨ 新增 并发限制功能（每个key同时只能1个请求）
+- ✨ 新增 有效期管理（7天过期自动标记）
+- ✨ 新增 `release_key()` 方法（请求完成必须调用）
+- ✨ 新增 `replace_key()` 方法（方便过期更换）
+- ✨ 新增 `get_expired_keys()` / `get_expiring_keys()` 方法
+- ✨ 新增 后台清理线程（每小时检查过期key）
+- 🔧 优化 CLI工具支持过期管理命令
+- 🔧 优化 统计信息包含剩余有效期
+
+### v2.0.0
 - ✨ 新增 QPS限制功能
 - ✨ 新增 备用key支持
 - ✨ 新增 请求时间戳队列

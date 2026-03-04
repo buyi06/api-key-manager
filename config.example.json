@@ -1,0 +1,33 @@
+{
+  "providers": {
+    "custom": {
+      "apiKeys": [
+        "sk-example-key-1",
+        "sk-example-key-2"
+      ],
+      "limits": {
+        "qps": 10,
+        "concurrency": 1,
+        "maxAgeDays": 7,
+        "cooldownSeconds": 30
+      },
+      "loadBalancing": {
+        "strategy": "round-robin"
+      },
+      "fallback": {
+        "enabled": false,
+        "name": "备用Key",
+        "apiKey": "sk-fallback-key",
+        "baseURL": "https://api.example.com"
+      },
+      "keyMetadata": {
+        "sk-example-key-1": {
+          "created_at": 1709510400
+        },
+        "sk-example-key-2": {
+          "created_at": 1709596800
+        }
+      }
+    }
+  }
+}

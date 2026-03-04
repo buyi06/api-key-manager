@@ -1,45 +1,179 @@
 #!/usr/bin/env python3
 """
 API Key 轮询管理器
-支持多个 API key 的负载均衡和简单故障转移
+支持多个 API key 的负载均衡和故障转移
+
+特性:
+- 并发限制: 每个key同时只能1个请求
+- QPS限制: 每个key限制10 QPS
+- 有效期: 每个key 7天有效期，过期自动标记
+- 智能故障转移: 429错误自动冷却
 """
 
 import json
 import time
 import threading
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from collections import deque
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+
+
+@dataclass
+class KeyStats:
+    """单个Key的统计信息"""
+    requests: int = 0
+    errors: int = 0
+    last_used: float = 0.0
+    healthy: bool = True
+    request_times: deque = field(default_factory=lambda: deque(maxlen=100))
+    active_requests: int = 0  # 当前活跃请求数
+    created_at: float = field(default_factory=time.time)  # key添加时间
+    is_fallback: bool = False
+    cooldown_until: float = 0.0  # 冷却结束时间
+    
+    def is_expired(self, max_age_days: float = 7.0) -> bool:
+        """检查key是否过期"""
+        return time.time() - self.created_at > max_age_days * 24 * 3600
+    
+    def is_in_cooldown(self) -> bool:
+        """检查是否在冷却期"""
+        return time.time() < self.cooldown_until
+    
+    def get_remaining_time(self, max_age_days: float = 7.0) -> float:
+        """获取剩余有效时间（秒）"""
+        remaining = max_age_days * 24 * 3600 - (time.time() - self.created_at)
+        return max(0, remaining)
 
 
 class APIKeyManager:
+    # 默认配置
+    DEFAULT_QPS_LIMIT = 10
+    DEFAULT_CONCURRENCY_LIMIT = 1
+    DEFAULT_MAX_AGE_DAYS = 7.0
+    DEFAULT_COOLDOWN_SECONDS = 30.0
+    
     def __init__(self, config_path: str = "/root/.nanobot/config.json"):
-        # 优先使用本地配置文件（包含真实key），如果不存在则使用公共配置文件
-        local_config_path = "/root/.nanobot/config.local.json"
         import os
+        
+        # 优先使用本地配置文件
+        local_config_path = config_path.replace(".json", ".local.json")
         if os.path.exists(local_config_path):
             self.config_path = local_config_path
         else:
             self.config_path = config_path
+        
+        # Key池
         self.api_keys: List[str] = []
         self.current_index: int = 0
-        # QPS限制配置
-        self.qps_limit_per_key = 10  # 每个key限制10 QPS
-        self.qps_window = 1.0  # 时间窗口1秒
-        # key_stats 结构:
-        # {
-        #   key: {
-        #       'requests': int,
-        #       'errors': int,
-        #       'last_used': float(timestamp),
-        #       'healthy': bool,
-        #       'request_times': deque([timestamp1, timestamp2, ...])  # 请求时间戳队列
-        #   }
-        # }
-        self.key_stats: Dict[str, Dict] = {}
-        self.lock = threading.Lock()
+        
+        # 限制配置
+        self.qps_limit = self.DEFAULT_QPS_LIMIT
+        self.concurrency_limit = self.DEFAULT_CONCURRENCY_LIMIT
+        self.max_age_days = self.DEFAULT_MAX_AGE_DAYS
+        self.cooldown_seconds = self.DEFAULT_COOLDOWN_SECONDS
+        self.qps_window = 1.0  # QPS时间窗口
+        
+        # 统计信息
+        self.key_stats: Dict[str, KeyStats] = {}
+        
+        # 线程安全
+        self.lock = threading.RLock()
+        
+        # 负载均衡策略
         self.strategy = "round-robin"
+        
+        # 备用key
+        self.fallback_key: Optional[str] = None
+        self.fallback_config: Optional[Dict] = None
+        
+        # 加载配置
         self.load_config()
-
+        
+        # 启动后台清理线程
+        self._start_cleanup_thread()
+    
+    def _start_cleanup_thread(self):
+        """启动后台线程定期清理过期key"""
+        def cleanup_loop():
+            while True:
+                time.sleep(3600)  # 每小时检查一次
+                self._cleanup_expired_keys()
+        
+        thread = threading.Thread(target=cleanup_loop, daemon=True)
+        thread.start()
+    
+    def _cleanup_expired_keys(self):
+        """清理过期的key"""
+        with self.lock:
+            expired_keys = [
+                k for k in self.api_keys 
+                if self.key_stats.get(k) and self.key_stats[k].is_expired(self.max_age_days)
+            ]
+            for key in expired_keys:
+                if key != self.fallback_key:  # 保留备用key
+                    print(f"⚠️ Key已过期（{self.max_age_days}天）: {self._mask_key(key)}")
+                    # 标记为不健康而不是直接移除，让用户决定
+                    self.key_stats[key].healthy = False
+    
+    def load_config(self):
+        """加载配置文件"""
+        import os
+        
+        if not os.path.exists(self.config_path):
+            print(f"⚠️ 配置文件不存在: {self.config_path}")
+            return
+        
+        try:
+            with open(self.config_path, "r") as f:
+                config = json.load(f)
+            
+            providers = config.get("providers", {})
+            custom = providers.get("custom", {})
+            
+            # 加载key池
+            self.api_keys = custom.get("apiKeys", [])
+            
+            # 加载限制配置
+            limits = custom.get("limits", {})
+            self.qps_limit = limits.get("qps", self.DEFAULT_QPS_LIMIT)
+            self.concurrency_limit = limits.get("concurrency", self.DEFAULT_CONCURRENCY_LIMIT)
+            self.max_age_days = limits.get("maxAgeDays", self.DEFAULT_MAX_AGE_DAYS)
+            self.cooldown_seconds = limits.get("cooldownSeconds", self.DEFAULT_COOLDOWN_SECONDS)
+            
+            # 加载负载均衡策略
+            lb = custom.get("loadBalancing", {})
+            self.strategy = lb.get("strategy", "round-robin")
+            
+            # 加载备用key
+            fallback = custom.get("fallback", {})
+            if fallback.get("enabled", False):
+                self.fallback_key = fallback.get("apiKey")
+                self.fallback_config = fallback
+                if self.fallback_key and self.fallback_key not in self.api_keys:
+                    self.api_keys.append(self.fallback_key)
+            
+            # 初始化统计
+            # 先加载keyMetadata（包含创建时间）
+            key_metadata = custom.get("keyMetadata", {})
+            for key in self.api_keys:
+                metadata = key_metadata.get(key, {})
+                created_at = metadata.get("created_at", time.time())
+                if key not in self.key_stats:
+                    self.key_stats[key] = KeyStats(
+                        created_at=created_at,
+                        is_fallback=(key == self.fallback_key)
+                    )
+                else:
+                    # 更新已存在的key的创建时间
+                    self.key_stats[key].created_at = created_at
+            
+            print(f"✅ 已加载 {len(self.api_keys)} 个API keys")
+            print(f"   QPS限制: {self.qps_limit}/s, 并发限制: {self.concurrency_limit}, 有效期: {self.max_age_days}天")
+            
+        except Exception as e:
+            print(f"❌ 加载配置失败: {e}")
+    
     def _is_key_rate_limited(self, api_key: str) -> bool:
         """检查key是否超过QPS限制"""
         stats = self.key_stats.get(api_key)
@@ -47,203 +181,302 @@ class APIKeyManager:
             return False
         
         current_time = time.time()
-        request_times = stats["request_times"]
+        request_times = stats.request_times
         
-        # 清理过期的请求时间戳（超过时间窗口的）
+        # 清理过期的时间戳
         while request_times and current_time - request_times[0] > self.qps_window:
             request_times.popleft()
         
-        # 检查当前窗口内的请求数是否超过限制
-        return len(request_times) >= self.qps_limit_per_key
-
-    def load_config(self):
-        """加载配置文件中的 key 列表"""
-        try:
-            with open(self.config_path, "r") as f:
-                config = json.load(f)
-
-            providers = config.get("providers", {})
-            custom = providers.get("custom", {})
-
-            # 你自己维护的 key 池
-            self.api_keys = custom.get("apiKeys", [])
-            
-            # 添加备用key到key池
-            fallback = custom.get("fallback", {})
-            if fallback.get("enabled", False):
-                fallback_key = fallback.get("apiKey")
-                if fallback_key:
-                    self.fallback_key = fallback_key
-                    self.fallback_config = fallback
-                    # 如果备用key不在主key池中，添加它
-                    if fallback_key not in self.api_keys:
-                        self.api_keys.append(fallback_key)
-                        print(f"✅ 备用key已添加: {fallback.get('name', 'Unknown')}")
-                    else:
-                        print(f"✅ 备用key已配置: {fallback.get('name', 'Unknown')}")
-                else:
-                    self.fallback_key = None
-                    self.fallback_config = None
-            else:
-                self.fallback_key = None
-                self.fallback_config = None
-
-            # 负载策略
-            lb = custom.get("loadBalancing", {})
-            self.strategy = lb.get("strategy", "round-robin")
-
-            # 初始化统计
-            for key in self.api_keys:
-                if key not in self.key_stats:
-                    self.key_stats[key] = {
-                        "requests": 0,
-                        "errors": 0,
-                        "last_used": 0.0,
-                        "healthy": True,
-                        "request_times": deque(maxlen=self.qps_limit_per_key * 2),  # 保存最近2倍限制的请求
-                        "is_fallback": key == self.fallback_key if hasattr(self, 'fallback_key') else False
-                    }
-        except Exception as e:
-            print(f"加载配置失败: {e}")
-
+        return len(request_times) >= self.qps_limit
+    
+    def _is_key_at_concurrency_limit(self, api_key: str) -> bool:
+        """检查key是否达到并发限制"""
+        stats = self.key_stats.get(api_key)
+        if not stats:
+            return False
+        return stats.active_requests >= self.concurrency_limit
+    
+    def _is_key_available(self, api_key: str) -> bool:
+        """检查key是否可用（健康、未过期、未限流、未达并发限制）"""
+        stats = self.key_stats.get(api_key)
+        if not stats:
+            return False
+        
+        # 检查健康状态
+        if not stats.healthy:
+            return False
+        
+        # 检查是否过期
+        if stats.is_expired(self.max_age_days) and not stats.is_fallback:
+            return False
+        
+        # 检查是否在冷却期
+        if stats.is_in_cooldown():
+            return False
+        
+        # 检查QPS限制
+        if self._is_key_rate_limited(api_key):
+            return False
+        
+        # 检查并发限制
+        if self._is_key_at_concurrency_limit(api_key):
+            return False
+        
+        return True
+    
     def get_next_key(self) -> Optional[str]:
-        """获取下一个可用的 API key。若全部不健康，返回 None"""
+        """获取下一个可用的API key"""
         with self.lock:
             if not self.api_keys:
                 return None
-
+            
             if self.strategy == "least-used":
                 return self._least_used()
             else:
                 return self._round_robin()
-
+    
     def _round_robin(self) -> Optional[str]:
-        """轮询策略: 跳过不健康 key 和 QPS限制 key，全不健康/全限制则返回 None"""
+        """轮询策略"""
         n = len(self.api_keys)
         if n == 0:
             return None
-
+        
         attempts = 0
         while attempts < n:
             key = self.api_keys[self.current_index]
             self.current_index = (self.current_index + 1) % n
-
-            stats = self.key_stats.get(key)
-            if stats and stats.get("healthy", True) and not self._is_key_rate_limited(key):
+            
+            if self._is_key_available(key):
                 # 记录请求
-                current_time = time.time()
-                stats["requests"] += 1
-                stats["last_used"] = current_time
-                stats["request_times"].append(current_time)
+                self._record_request_start(key)
                 return key
-
+            
             attempts += 1
-
-        # 全部不健康或全部达到QPS限制
+        
+        # 没有可用的key
         return None
-
+    
     def _least_used(self) -> Optional[str]:
-        """最少使用策略: 在健康且未达QPS限制的 key 中选 requests 最少的"""
-        available_keys = [
-            k for k in self.api_keys
-            if (self.key_stats.get(k, {}).get("healthy", True) and 
-                not self._is_key_rate_limited(k))
-        ]
+        """最少使用策略"""
+        available_keys = [k for k in self.api_keys if self._is_key_available(k)]
         if not available_keys:
             return None
-
-        best_key = min(available_keys, key=lambda k: self.key_stats[k]["requests"])
-        current_time = time.time()
-        self.key_stats[best_key]["requests"] += 1
-        self.key_stats[best_key]["last_used"] = current_time
-        self.key_stats[best_key]["request_times"].append(current_time)
+        
+        best_key = min(available_keys, key=lambda k: self.key_stats[k].requests)
+        self._record_request_start(best_key)
         return best_key
-
-    def mark_error(self, api_key: str, error_type: str = "429"):
+    
+    def _record_request_start(self, api_key: str):
+        """记录请求开始"""
+        stats = self.key_stats[api_key]
+        current_time = time.time()
+        stats.requests += 1
+        stats.last_used = current_time
+        stats.request_times.append(current_time)
+        stats.active_requests += 1
+    
+    def release_key(self, api_key: str):
+        """释放key（请求完成后调用）"""
+        with self.lock:
+            stats = self.key_stats.get(api_key)
+            if stats:
+                stats.active_requests = max(0, stats.active_requests - 1)
+    
+    def mark_error(self, api_key: str, error_type: str = "429", retry_after: Optional[int] = None):
         """
-        标记某个 key 出错。
-        - 429: 视为临时性限流 -> 30 秒冷却，期间不参与分配
-        - 401 等致命错误: 你可以选择直接移除 / 标记为永久不健康
+        标记key出错
+        
+        Args:
+            api_key: 出错的key
+            error_type: 错误类型 (429, 401, 403等)
+            retry_after: 服务器建议的重试等待时间（秒）
         """
         with self.lock:
             stats = self.key_stats.get(api_key)
             if not stats:
                 return
-
-            stats["errors"] += 1
-
+            
+            stats.errors += 1
+            
             if error_type == "429":
-                # 临时限流: 进入冷却
-                stats["healthy"] = False
-                # 30 秒后尝试恢复为健康状态
-                threading.Timer(30.0, self._recover_key, args=[api_key]).start()
-            elif error_type in ("401", "unauthorized"):
-                # 认证错误: 可以选择直接标记为长期不健康
-                stats["healthy"] = False
-                # 你也可以在这里选择调用 remove_key(api_key)
-
+                # 限流错误：进入冷却
+                cooldown = retry_after if retry_after else int(self.cooldown_seconds)
+                stats.cooldown_until = time.time() + cooldown
+                stats.healthy = False
+                print(f"⚠️ Key {self._mask_key(api_key)} 触发429，冷却{cooldown}秒")
+                
+                # 冷却结束后恢复
+                threading.Timer(cooldown, self._recover_key, args=[api_key]).start()
+                
+            elif error_type in ("401", "403", "unauthorized"):
+                # 认证错误：永久标记为不健康
+                stats.healthy = False
+                print(f"❌ Key {self._mask_key(api_key)} 认证失败({error_type})，已标记为不健康")
+    
     def _recover_key(self, api_key: str):
-        """冷却结束后尝试恢复 key 的健康状态。真正的"测试"由下一次实际请求来完成。"""
+        """冷却结束后恢复key"""
         with self.lock:
             stats = self.key_stats.get(api_key)
             if stats:
-                stats["healthy"] = True
-
-    def add_key(self, api_key: str):
-        """添加新的 API key"""
-        with self.lock:
-            if api_key not in self.api_keys:
-                self.api_keys.append(api_key)
-                self.key_stats[api_key] = {
-                    "requests": 0,
-                    "errors": 0,
-                    "last_used": 0.0,
-                    "healthy": True,
-                    "request_times": deque(maxlen=self.qps_limit_per_key * 2),
-                }
-                self._save_config()
-
-    def remove_key(self, api_key: str):
-        """移除 API key"""
+                stats.healthy = True
+                stats.cooldown_until = 0.0
+                print(f"✅ Key {self._mask_key(api_key)} 已从冷却中恢复")
+    
+    def add_key(self, api_key: str, created_at: Optional[float] = None) -> bool:
+        """
+        添加新的API key
+        
+        Args:
+            api_key: 要添加的key
+            created_at: key的创建时间（用于恢复已知的key）
+        
+        Returns:
+            是否添加成功
+        """
         with self.lock:
             if api_key in self.api_keys:
-                self.api_keys.remove(api_key)
-                self.key_stats.pop(api_key, None)
+                print(f"⚠️ Key已存在: {self._mask_key(api_key)}")
+                return False
+            
+            self.api_keys.append(api_key)
+            self.key_stats[api_key] = KeyStats(
+                created_at=created_at if created_at else time.time(),
+                is_fallback=False
+            )
+            self._save_config()
+            print(f"✅ 已添加Key: {self._mask_key(api_key)}")
+            return True
+    
+    def remove_key(self, api_key: str) -> bool:
+        """移除API key"""
+        with self.lock:
+            if api_key not in self.api_keys:
+                return False
+            
+            self.api_keys.remove(api_key)
+            self.key_stats.pop(api_key, None)
+            self._save_config()
+            print(f"✅ 已移除Key: {self._mask_key(api_key)}")
+            return True
+    
+    def replace_key(self, old_key: str, new_key: str) -> bool:
+        """替换key（用于过期更换）"""
+        with self.lock:
+            if old_key in self.api_keys:
+                idx = self.api_keys.index(old_key)
+                self.api_keys[idx] = new_key
+                self.key_stats.pop(old_key, None)
+                self.key_stats[new_key] = KeyStats(created_at=time.time())
                 self._save_config()
-
+                print(f"✅ 已替换Key: {self._mask_key(old_key)} -> {self._mask_key(new_key)}")
+                return True
+            return False
+    
     def _save_config(self):
-        """把 apiKeys 写回配置文件（只改自己这部分）"""
+        """保存配置到文件"""
         try:
-            with open(self.config_path, "r") as f:
-                config = json.load(f)
-
+            import os
+            
+            # 读取现有配置
+            if os.path.exists(self.config_path):
+                with open(self.config_path, "r") as f:
+                    config = json.load(f)
+            else:
+                config = {}
+            
             providers = config.setdefault("providers", {})
             custom = providers.setdefault("custom", {})
             custom["apiKeys"] = self.api_keys
-
+            
+            # 保存key的创建时间（用于恢复）
+            key_metadata = {}
+            for key in self.api_keys:
+                stats = self.key_stats.get(key)
+                if stats:
+                    key_metadata[key] = {
+                        "created_at": stats.created_at
+                    }
+            custom["keyMetadata"] = key_metadata
+            
             with open(self.config_path, "w") as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
+                
         except Exception as e:
-            print(f"保存配置失败: {e}")
-
+            print(f"❌ 保存配置失败: {e}")
+    
     def get_stats(self) -> Dict:
-        """获取简单统计信息"""
+        """获取统计信息"""
         with self.lock:
+            now = time.time()
+            key_details = {}
+            
+            for key in self.api_keys:
+                stats = self.key_stats.get(key)
+                if not stats:
+                    continue
+                
+                remaining = stats.get_remaining_time(self.max_age_days)
+                key_details[key] = {
+                    "masked": self._mask_key(key),
+                    "requests": stats.requests,
+                    "errors": stats.errors,
+                    "healthy": stats.healthy,
+                    "active_requests": stats.active_requests,
+                    "created_at": stats.created_at,
+                    "remaining_seconds": remaining,
+                    "remaining_hours": remaining / 3600,
+                    "remaining_days": remaining / 86400,
+                    "is_expired": stats.is_expired(self.max_age_days),
+                    "is_fallback": stats.is_fallback,
+                    "in_cooldown": stats.is_in_cooldown(),
+                }
+            
             return {
                 "total_keys": len(self.api_keys),
-                "healthy_keys": sum(
-                    1
-                    for k in self.api_keys
-                    if self.key_stats.get(k, {}).get("healthy", True)
-                ),
-                "total_requests": sum(
-                    self.key_stats[k]["requests"] for k in self.api_keys
-                ),
-                "total_errors": sum(
-                    self.key_stats[k]["errors"] for k in self.api_keys
-                ),
-                "key_details": self.key_stats.copy(),
+                "healthy_keys": sum(1 for k in self.api_keys if self._is_key_available(k)),
+                "expired_keys": sum(1 for k in self.api_keys 
+                                   if self.key_stats.get(k) and self.key_stats[k].is_expired(self.max_age_days)),
+                "total_requests": sum(self.key_stats[k].requests for k in self.api_keys if self.key_stats.get(k)),
+                "total_errors": sum(self.key_stats[k].errors for k in self.api_keys if self.key_stats.get(k)),
+                "config": {
+                    "qps_limit": self.qps_limit,
+                    "concurrency_limit": self.concurrency_limit,
+                    "max_age_days": self.max_age_days,
+                    "cooldown_seconds": self.cooldown_seconds,
+                    "strategy": self.strategy,
+                },
+                "key_details": key_details,
             }
+    
+    def _mask_key(self, key: str) -> str:
+        """遮蔽key中间部分"""
+        if len(key) <= 12:
+            return key[:4] + "*" * (len(key) - 4)
+        return key[:8] + "*" * (len(key) - 12) + key[-4:]
+    
+    def get_expired_keys(self) -> List[Tuple[str, float]]:
+        """获取所有过期的key及其过期时间"""
+        with self.lock:
+            expired = []
+            for key in self.api_keys:
+                stats = self.key_stats.get(key)
+                if stats and stats.is_expired(self.max_age_days) and not stats.is_fallback:
+                    expired_at = stats.created_at + self.max_age_days * 86400
+                    expired.append((key, expired_at))
+            return expired
+    
+    def get_expiring_keys(self, within_hours: float = 24) -> List[Tuple[str, float]]:
+        """获取即将过期的key（默认24小时内）"""
+        with self.lock:
+            expiring = []
+            for key in self.api_keys:
+                stats = self.key_stats.get(key)
+                if stats and not stats.is_fallback:
+                    remaining = stats.get_remaining_time(self.max_age_days)
+                    if 0 < remaining < within_hours * 3600:
+                        expired_at = stats.created_at + self.max_age_days * 86400
+                        expiring.append((key, expired_at, remaining))
+            return expiring
 
 
 # 全局实例
@@ -251,6 +484,45 @@ key_manager = APIKeyManager()
 
 
 if __name__ == "__main__":
-    print("API Key 管理器测试:")
-    print(f"当前 keys: {key_manager.api_keys}")
-    print(f"统计: {json.dumps(key_manager.get_stats(), indent=2, ensure_ascii=False)}")
+    import sys
+    
+    print("🔑 API Key 管理器")
+    print("=" * 50)
+    
+    stats = key_manager.get_stats()
+    print(f"\n📊 总览:")
+    print(f"   总keys: {stats['total_keys']}")
+    print(f"   可用: {stats['healthy_keys']}")
+    print(f"   过期: {stats['expired_keys']}")
+    print(f"   总请求: {stats['total_requests']}")
+    print(f"   总错误: {stats['total_errors']}")
+    
+    print(f"\n⚙️ 配置:")
+    for k, v in stats['config'].items():
+        print(f"   {k}: {v}")
+    
+    print(f"\n📋 Key详情:")
+    for key, details in stats['key_details'].items():
+        status = "✅" if details['healthy'] and not details['is_expired'] else "❌"
+        if details['in_cooldown']:
+            status = "⏳"
+        print(f"   {status} {details['masked']}")
+        print(f"      请求: {details['requests']}, 错误: {details['errors']}, 活跃: {details['active_requests']}")
+        print(f"      剩余: {details['remaining_hours']:.1f}小时 ({details['remaining_days']:.2f}天)")
+        if details['is_expired']:
+            print(f"      ⚠️ 已过期!")
+        elif details['remaining_hours'] < 24:
+            print(f"      ⚠️ 即将过期!")
+    
+    # 检查过期和即将过期的key
+    expired = key_manager.get_expired_keys()
+    if expired:
+        print(f"\n🚨 已过期的keys:")
+        for key, expired_at in expired:
+            print(f"   {key_manager._mask_key(key)} - 过期于 {datetime.fromtimestamp(expired_at)}")
+    
+    expiring = key_manager.get_expiring_keys(within_hours=24)
+    if expiring:
+        print(f"\n⚠️ 24小时内将过期的keys:")
+        for key, expired_at, remaining in expiring:
+            print(f"   {key_manager._mask_key(key)} - 剩余 {remaining/3600:.1f}小时")
