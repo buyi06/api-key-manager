@@ -123,6 +123,12 @@ python3 manage_keys.py test
 
 # 设置key的创建时间（用于恢复已知key）
 python3 manage_keys.py set sk-xxx "2026-03-01T00:00:00"
+
+# 备用key管理
+python3 manage_keys.py fallback set sk-backup-key              # 设置备用key
+python3 manage_keys.py fallback set sk-backup-key https://api.xxx.com  # 带自定义URL
+python3 manage_keys.py fallback show                           # 显示备用key状态
+python3 manage_keys.py fallback clear                          # 清除备用key
 ```
 
 ## 📋 API 参考
@@ -140,6 +146,10 @@ python3 manage_keys.py set sk-xxx "2026-03-01T00:00:00"
 - `get_stats()` - 获取统计信息
 - `get_expired_keys()` - 获取所有过期的key
 - `get_expiring_keys(within_hours=24)` - 获取即将过期的key
+- `set_fallback_key(api_key, base_url=None)` - 设置备用key（永不过期）
+- `get_fallback_status()` - 获取备用key状态
+- `clear_fallback_key()` - 清除备用key
+- `get_all_regular_keys_expired()` - 检查是否所有主key都已过期
 - `load_config()` - 加载配置文件
 
 #### 负载均衡策略
@@ -176,9 +186,29 @@ python3 manage_keys.py set sk-xxx "2026-03-01T00:00:00"
 
 #### 备用key机制
 
-- **自动添加**: 备用key自动加入key池
-- **优先级**: 主key优先，备用key作为最后选择
+备用key是一个特殊的key，用于在所有主key都不可用时提供兜底服务：
+
+- **永不过期**: 备用key不受有效期限制
+- **不参与轮询**: 正常情况下备用key不会被选中
+- **自动启用**: 当所有主key都过期/不健康时自动启用
+- **使用场景**: 协助更新主key、紧急情况下的兜底服务
 - **独立统计**: 备用key有独立的使用统计
+- **可配置URL**: 支持配置独立的API基础URL
+
+```python
+# 设置备用key
+key_manager.set_fallback_key("sk-backup-key", "https://api.example.com")
+
+# 检查备用key状态
+status = key_manager.get_fallback_status()
+if status:
+    print(f"备用key: {status['masked']}")
+    print(f"健康: {status['healthy']}")
+
+# 检查是否需要启用备用key
+if key_manager.get_all_regular_keys_expired():
+    print("⚠️ 所有主key已过期，备用key将自动启用")
+```
 
 ## 🔧 系统要求
 
@@ -344,7 +374,15 @@ python3 compatibility_test.py
 
 ## 🔄 版本历史
 
-### v3.0.0 (最新)
+### v3.1.0 (最新)
+- ✨ 增强 备用key功能完善
+  - 备用key永不过期
+  - 不参与正常轮询
+  - 所有主key不可用时自动启用
+  - 新增 `set_fallback_key()`, `get_fallback_status()`, `clear_fallback_key()` 方法
+  - CLI新增 `fallback set/show/clear` 命令
+
+### v3.0.0
 - ✨ 新增 并发限制功能（每个key同时只能1个请求）
 - ✨ 新增 有效期管理（7天过期自动标记）
 - ✨ 新增 `release_key()` 方法（请求完成必须调用）

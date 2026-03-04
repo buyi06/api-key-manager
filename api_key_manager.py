@@ -196,18 +196,27 @@ class APIKeyManager:
             return False
         return stats.active_requests >= self.concurrency_limit
     
-    def _is_key_available(self, api_key: str) -> bool:
-        """检查key是否可用（健康、未过期、未限流、未达并发限制）"""
+    def _is_key_available(self, api_key: str, include_fallback: bool = False) -> bool:
+        """检查key是否可用（健康、未过期、未限流、未达并发限制）
+        
+        Args:
+            api_key: 要检查的key
+            include_fallback: 是否包含备用key（默认不包含）
+        """
         stats = self.key_stats.get(api_key)
         if not stats:
+            return False
+        
+        # 备用key需要特殊处理
+        if stats.is_fallback and not include_fallback:
             return False
         
         # 检查健康状态
         if not stats.healthy:
             return False
         
-        # 检查是否过期
-        if stats.is_expired(self.max_age_days) and not stats.is_fallback:
+        # 备用key永不过期，普通key检查过期
+        if not stats.is_fallback and stats.is_expired(self.max_age_days):
             return False
         
         # 检查是否在冷却期
@@ -225,17 +234,49 @@ class APIKeyManager:
         return True
     
     def get_next_key(self) -> Optional[str]:
-        """获取下一个可用的API key"""
+        """获取下一个可用的API key
+        
+        优先使用普通key，当所有普通key都不可用时才使用备用key
+        """
         with self.lock:
             if not self.api_keys:
                 return None
             
+            # 先尝试普通key（不包含fallback）
             if self.strategy == "least-used":
-                return self._least_used()
+                key = self._least_used(include_fallback=False)
             else:
-                return self._round_robin()
+                key = self._round_robin(include_fallback=False)
+            
+            # 如果没有可用的普通key，尝试备用key
+            if key is None and self.fallback_key:
+                key = self._get_fallback_key()
+                if key:
+                    print(f"🔄 所有主key不可用，使用备用key")
+            
+            return key
     
-    def _round_robin(self) -> Optional[str]:
+    def _get_fallback_key(self) -> Optional[str]:
+        """获取备用key（如果可用）"""
+        if not self.fallback_key:
+            return None
+        
+        stats = self.key_stats.get(self.fallback_key)
+        if not stats:
+            return None
+        
+        # 备用key检查：健康、不在冷却、未达限流
+        if not stats.healthy or stats.is_in_cooldown():
+            return None
+        if self._is_key_rate_limited(self.fallback_key):
+            return None
+        if self._is_key_at_concurrency_limit(self.fallback_key):
+            return None
+        
+        self._record_request_start(self.fallback_key)
+        return self.fallback_key
+    
+    def _round_robin(self, include_fallback: bool = False) -> Optional[str]:
         """轮询策略"""
         n = len(self.api_keys)
         if n == 0:
@@ -246,7 +287,7 @@ class APIKeyManager:
             key = self.api_keys[self.current_index]
             self.current_index = (self.current_index + 1) % n
             
-            if self._is_key_available(key):
+            if self._is_key_available(key, include_fallback=include_fallback):
                 # 记录请求
                 self._record_request_start(key)
                 return key
@@ -256,9 +297,9 @@ class APIKeyManager:
         # 没有可用的key
         return None
     
-    def _least_used(self) -> Optional[str]:
+    def _least_used(self, include_fallback: bool = False) -> Optional[str]:
         """最少使用策略"""
-        available_keys = [k for k in self.api_keys if self._is_key_available(k)]
+        available_keys = [k for k in self.api_keys if self._is_key_available(k, include_fallback=include_fallback)]
         if not available_keys:
             return None
         
@@ -386,7 +427,10 @@ class APIKeyManager:
             
             providers = config.setdefault("providers", {})
             custom = providers.setdefault("custom", {})
-            custom["apiKeys"] = self.api_keys
+            
+            # 保存keys时排除备用key（备用key单独保存）
+            regular_keys = [k for k in self.api_keys if k != self.fallback_key]
+            custom["apiKeys"] = regular_keys
             
             # 保存key的创建时间（用于恢复）
             key_metadata = {}
@@ -397,6 +441,16 @@ class APIKeyManager:
                         "created_at": stats.created_at
                     }
             custom["keyMetadata"] = key_metadata
+            
+            # 保存备用key配置
+            if self.fallback_key:
+                custom["fallback"] = {
+                    "enabled": True,
+                    "apiKey": self.fallback_key,
+                    "baseURL": self.fallback_config.get("baseURL") if self.fallback_config else None
+                }
+            else:
+                custom["fallback"] = {"enabled": False}
             
             with open(self.config_path, "w") as f:
                 json.dump(config, f, indent=2, ensure_ascii=False)
@@ -477,6 +531,94 @@ class APIKeyManager:
                         expired_at = stats.created_at + self.max_age_days * 86400
                         expiring.append((key, expired_at, remaining))
             return expiring
+    
+    def set_fallback_key(self, api_key: str, base_url: Optional[str] = None) -> bool:
+        """
+        设置备用key
+        
+        Args:
+            api_key: 备用key
+            base_url: 可选的API基础URL
+        
+        Returns:
+            是否设置成功
+        """
+        with self.lock:
+            # 如果之前有备用key，先取消其标记
+            if self.fallback_key and self.fallback_key in self.key_stats:
+                self.key_stats[self.fallback_key].is_fallback = False
+            
+            self.fallback_key = api_key
+            self.fallback_config = {
+                "enabled": True,
+                "apiKey": api_key,
+                "baseURL": base_url
+            }
+            
+            # 如果key不在池中，添加进去
+            if api_key not in self.api_keys:
+                self.api_keys.append(api_key)
+            
+            # 初始化或更新统计信息
+            if api_key not in self.key_stats:
+                self.key_stats[api_key] = KeyStats(
+                    created_at=time.time(),
+                    is_fallback=True
+                )
+            else:
+                self.key_stats[api_key].is_fallback = True
+            
+            self._save_config()
+            print(f"✅ 已设置备用key: {self._mask_key(api_key)}")
+            return True
+    
+    def clear_fallback_key(self) -> bool:
+        """清除备用key"""
+        with self.lock:
+            if not self.fallback_key:
+                print("⚠️ 没有设置备用key")
+                return False
+            
+            old_key = self.fallback_key
+            if old_key in self.key_stats:
+                self.key_stats[old_key].is_fallback = False
+            
+            self.fallback_key = None
+            self.fallback_config = None
+            self._save_config()
+            print(f"✅ 已清除备用key: {self._mask_key(old_key)}")
+            return True
+    
+    def get_fallback_status(self) -> Optional[Dict]:
+        """获取备用key状态"""
+        with self.lock:
+            if not self.fallback_key:
+                return None
+            
+            stats = self.key_stats.get(self.fallback_key)
+            if not stats:
+                return None
+            
+            return {
+                "key": self.fallback_key,
+                "masked": self._mask_key(self.fallback_key),
+                "healthy": stats.healthy,
+                "requests": stats.requests,
+                "errors": stats.errors,
+                "active_requests": stats.active_requests,
+                "in_cooldown": stats.is_in_cooldown(),
+                "base_url": self.fallback_config.get("baseURL") if self.fallback_config else None,
+            }
+    
+    def get_all_regular_keys_expired(self) -> bool:
+        """检查是否所有普通key都已过期"""
+        with self.lock:
+            for key in self.api_keys:
+                stats = self.key_stats.get(key)
+                if stats and not stats.is_fallback:
+                    if not stats.is_expired(self.max_age_days) and stats.healthy:
+                        return False
+            return True
 
 
 # 全局实例

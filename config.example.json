@@ -15,9 +15,8 @@
         "strategy": "round-robin"
       },
       "fallback": {
-        "enabled": false,
-        "name": "备用Key",
-        "apiKey": "sk-fallback-key",
+        "enabled": true,
+        "apiKey": "sk-fallback-key-never-expires",
         "baseURL": "https://api.example.com"
       },
       "keyMetadata": {

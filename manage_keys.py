@@ -33,13 +33,18 @@ def show_help():
   expiring [hours]       显示即将过期的keys（默认24小时）
   test [count]           测试轮询功能
   set <key> <created>    设置key的创建时间（ISO格式）
-  help                   显示此帮助信息
+  
+  备用key管理:
+  fallback set <key> [base_url]  设置备用key（永不过期）
+  fallback show                  显示备用key状态
+  fallback clear                 清除备用key
 
 示例:
   python manage_keys.py add sk-xxxxxxxxxxxxx
   python manage_keys.py replace sk-old sk-new
   python manage_keys.py expiring 48
-  python manage_keys.py set sk-xxx "2026-03-01T00:00:00"
+  python manage_keys.py fallback set sk-backup-key https://api.example.com
+  python manage_keys.py fallback show
 """)
 
 
@@ -247,6 +252,46 @@ def set_created_time(api_key, created_str):
         print(f"   剩余: {remaining/3600:.1f}小时")
 
 
+def set_fallback_key(api_key, base_url=None):
+    """设置备用key"""
+    success = key_manager.set_fallback_key(api_key, base_url)
+    if success:
+        print(f"\n📌 备用key特性:")
+        print(f"   • 永不过期")
+        print(f"   • 不参与正常轮询")
+        print(f"   • 当所有主key都不可用时自动启用")
+        print(f"   • 用于协助更新主key")
+
+
+def show_fallback():
+    """显示备用key状态"""
+    status = key_manager.get_fallback_status()
+    if not status:
+        print("⚠️ 没有设置备用key")
+        print("\n使用以下命令设置备用key:")
+        print("  python manage_keys.py fallback set <key> [base_url]")
+        return
+    
+    print("📌 备用Key状态")
+    print("-" * 50)
+    print(f"   Key: {status['masked']}")
+    print(f"   状态: {'✅ 可用' if status['healthy'] and not status['in_cooldown'] else '❌ 不可用'}")
+    print(f"   请求: {status['requests']} | 错误: {status['errors']} | 活跃: {status['active_requests']}")
+    print(f"   有效期: ∞ (永不过期)")
+    if status['base_url']:
+        print(f"   Base URL: {status['base_url']}")
+    
+    # 检查主key状态
+    all_expired = key_manager.get_all_regular_keys_expired()
+    if all_expired:
+        print(f"\n⚠️ 所有主key已过期，备用key将自动启用！")
+
+
+def clear_fallback():
+    """清除备用key"""
+    key_manager.clear_fallback_key()
+
+
 def main():
     """主函数"""
     if len(sys.argv) < 2:
@@ -289,6 +334,25 @@ def main():
             print("❌ 请提供key和创建时间")
             return
         set_created_time(sys.argv[2], sys.argv[3])
+    elif command == "fallback":
+        if len(sys.argv) < 3:
+            print("❌ 请提供fallback子命令: set, show, clear")
+            return
+        sub_cmd = sys.argv[2].lower()
+        if sub_cmd == "set":
+            if len(sys.argv) < 4:
+                print("❌ 请提供备用key")
+                return
+            api_key = sys.argv[3]
+            base_url = sys.argv[4] if len(sys.argv) > 4 else None
+            set_fallback_key(api_key, base_url)
+        elif sub_cmd == "show":
+            show_fallback()
+        elif sub_cmd == "clear":
+            clear_fallback()
+        else:
+            print(f"❌ 未知的fallback子命令: {sub_cmd}")
+            print("   可用: set, show, clear")
     else:
         print(f"❌ 未知命令: {command}")
         show_help()
